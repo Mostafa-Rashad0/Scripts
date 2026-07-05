@@ -1,0 +1,739 @@
+#!/usr/bin/env bash
+#
+# newpy - Scaffold a modern Python project on Ubuntu.
+#
+# Usage: newpy [--help] [--version]
+#
+# Author: Generated for Disha
+# License: MIT
+
+set -Eeuo pipefail
+
+# ---------------------------------------------------------------------------
+# Constants & global state
+# ---------------------------------------------------------------------------
+
+readonly NEWPY_VERSION="1.1.1"
+readonly STATE_DIR="${HOME}/.local/state/newpy"
+readonly LOG_FILE="${STATE_DIR}/newpy.log"
+
+# Colors (ANSI-C quoting so these hold real escape bytes, not literal
+# backslash text — this lets them be used directly in heredocs as well
+# as via `printf '%b'`).
+readonly COLOR_RESET=$'\033[0m'
+readonly COLOR_RED=$'\033[0;31m'
+readonly COLOR_GREEN=$'\033[0;32m'
+readonly COLOR_YELLOW=$'\033[0;33m'
+readonly COLOR_BLUE=$'\033[0;34m'
+readonly COLOR_CYAN=$'\033[0;36m'
+readonly COLOR_BOLD=$'\033[1m'
+
+# Default packages installed in every project
+readonly DEFAULT_PACKAGES=(
+  black
+  ruff
+  pytest
+  isort
+  mypy
+  rich
+  python-dotenv
+)
+
+# A small pool of well-known package names used only to power
+# "did you mean...?" suggestions when a user-entered package can't be found.
+readonly KNOWN_PACKAGE_POOL=(
+  numpy pandas scipy matplotlib requests flask django fastapi uvicorn
+  pydantic sqlalchemy click typer httpx aiohttp beautifulsoup4 lxml
+  pillow pyyaml jinja2 celery redis pymongo psycopg2-binary boto3
+  scikit-learn tensorflow torch transformers openai anthropic gunicorn
+  pytest-cov tox tqdm loguru attrs cryptography paramiko fabric
+  selenium scrapy pygments markdown docutils sphinx black ruff isort
+  mypy rich python-dotenv setuptools wheel pip build twine
+)
+
+PROJECT_NAME=""
+PROJECT_DIR=""
+CREATED_DIR=false
+START_TIME=$(date +%s)
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+
+log_to_file() {
+  # Append a timestamped line to the log file (best-effort, never fatal).
+  mkdir -p "${STATE_DIR}" 2>/dev/null || true
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"${LOG_FILE}" 2>/dev/null || true
+}
+
+print_banner() {
+  printf '%b\n' "${COLOR_CYAN}${COLOR_BOLD}"
+  printf '%s\n' "  _ __   _____      ___ __  _   _ "
+  printf '%s\n' " | '_ \ / _ \ \ /\ / / '_ \| | | |"
+  printf '%s\n' " | | | |  __/\ V  V /| |_) | |_| |"
+  printf '%s\n' " |_| |_|\___| \_/\_/ | .__/ \__, |"
+  printf '%s\n' "                     |_|    |___/ "
+  printf '%b\n' "${COLOR_RESET}${COLOR_BOLD}  Modern Python project scaffolder${COLOR_RESET}\n"
+}
+
+print_info() {
+  printf '%b\n' "${COLOR_BLUE}[INFO]${COLOR_RESET} $*"
+  log_to_file "INFO: $*"
+}
+
+print_success() {
+  printf '%b\n' "${COLOR_GREEN}[ OK ]${COLOR_RESET} $*"
+  log_to_file "OK: $*"
+}
+
+print_warning() {
+  printf '%b\n' "${COLOR_YELLOW}[WARN]${COLOR_RESET} $*"
+  log_to_file "WARN: $*"
+}
+
+print_error() {
+  printf '%b\n' "${COLOR_RED}[FAIL]${COLOR_RESET} $*" >&2
+  log_to_file "ERROR: $*"
+}
+
+# ---------------------------------------------------------------------------
+# Spinner (for long-running commands run in the background)
+# ---------------------------------------------------------------------------
+
+run_with_spinner() {
+  # Usage: run_with_spinner "message" cmd arg1 arg2 ...
+  local message="$1"
+  shift
+
+  local logtmp
+  logtmp=$(mktemp)
+
+  ("$@") >"${logtmp}" 2>&1 &
+  local pid=$!
+
+  local spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+  local i=0
+  if [[ -t 1 ]]; then
+    while kill -0 "${pid}" 2>/dev/null; do
+      i=$(((i + 1) % ${#spin}))
+      printf '\r%b [%s] %s' "${COLOR_CYAN}" "${spin:$i:1}" "${message}${COLOR_RESET}"
+      sleep 0.1
+    done
+    printf '\r%*s\r' "$((${#message} + 8))" ""
+  fi
+
+  local status=0
+  wait "${pid}" || status=$?
+
+  if [[ ${status} -ne 0 ]]; then
+    print_error "${message} — failed"
+    cat "${logtmp}" >&2
+    rm -f "${logtmp}"
+    return "${status}"
+  fi
+
+  cat "${logtmp}" >>"${LOG_FILE}" 2>/dev/null || true
+  rm -f "${logtmp}"
+  print_success "${message}"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Cleanup / signal handling
+# ---------------------------------------------------------------------------
+
+cleanup_on_error() {
+  local exit_code=$?
+  trap - ERR INT TERM
+  print_error "newpy encountered an error (exit code ${exit_code})."
+  if [[ "${CREATED_DIR}" == true && -n "${PROJECT_DIR}" && -d "${PROJECT_DIR}" ]]; then
+    print_warning "Removing partially created project at ${PROJECT_DIR}"
+    rm -rf -- "${PROJECT_DIR}"
+  fi
+  print_info "See log for details: ${LOG_FILE}"
+  exit "${exit_code}"
+}
+
+handle_interrupt() {
+  trap - ERR INT TERM
+  echo
+  print_warning "Interrupted by user (Ctrl+C)."
+  if [[ "${CREATED_DIR}" == true && -n "${PROJECT_DIR}" && -d "${PROJECT_DIR}" ]]; then
+    print_warning "Removing partially created project at ${PROJECT_DIR}"
+    rm -rf -- "${PROJECT_DIR}"
+  fi
+  exit 130
+}
+
+trap cleanup_on_error ERR
+trap handle_interrupt INT TERM
+
+# ---------------------------------------------------------------------------
+# CLI flags
+# ---------------------------------------------------------------------------
+
+print_help() {
+  cat <<EOF
+${COLOR_BOLD}newpy${COLOR_RESET} — scaffold a modern Python project
+
+${COLOR_BOLD}USAGE${COLOR_RESET}
+    newpy [OPTIONS]
+
+${COLOR_BOLD}OPTIONS${COLOR_RESET}
+    -h, --help       Show this help message and exit
+    -v, --version    Show version information and exit
+
+${COLOR_BOLD}DESCRIPTION${COLOR_RESET}
+    Interactively creates a new Python project with a virtual environment,
+    a curated set of development tools (black, ruff, pytest, isort, mypy,
+    rich, python-dotenv), an optional Git repository, and starter files
+    (README.md, pyproject.toml, main.py, .gitignore).
+
+    You will be asked for a project name and a destination path (defaults
+    to the current directory). Relative paths, "~", and paths that don't
+    exist yet are all supported — non-existent directories can be created
+    for you on confirmation.
+
+${COLOR_BOLD}LOGS${COLOR_RESET}
+    Execution logs are written to:
+    ${STATE_DIR}/newpy.log
+EOF
+}
+
+print_version() {
+  printf 'newpy version %s\n' "${NEWPY_VERSION}"
+}
+
+parse_args() {
+  for arg in "$@"; do
+    case "${arg}" in
+      -h|--help)
+        print_help
+        exit 0
+        ;;
+      -v|--version)
+        print_version
+        exit 0
+        ;;
+      *)
+        print_error "Unknown option: ${arg}"
+        print_help
+        exit 1
+        ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Dependency checks
+# ---------------------------------------------------------------------------
+
+check_dependencies() {
+  print_info "Checking system dependencies..."
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    print_error "python3 is not installed."
+    print_info "Install it with: sudo apt update && sudo apt install python3"
+    exit 1
+  fi
+
+  local py_version
+  py_version=$(python3 -c 'import platform; print(platform.python_version())')
+  print_success "Found Python ${py_version}"
+
+  if ! python3 -m venv --help >/dev/null 2>&1; then
+    print_error "The 'venv' module is not available for your Python installation."
+    print_info "Install it with: sudo apt update && sudo apt install python3-venv"
+    exit 1
+  fi
+
+  if ! command -v curl >/dev/null 2>&1 && ! command -v ping >/dev/null 2>&1; then
+    print_warning "Neither curl nor ping found — cannot pre-check internet connectivity."
+  fi
+
+  print_success "All required dependencies are present."
+}
+
+check_internet() {
+  print_info "Checking internet connectivity..."
+  if command -v curl >/dev/null 2>&1; then
+    if ! curl -fsS --max-time 5 https://pypi.org >/dev/null 2>&1; then
+      print_error "Unable to reach pypi.org. Check your internet connection."
+      exit 1
+    fi
+  else
+    if ! ping -c 1 -W 3 pypi.org >/dev/null 2>&1; then
+      print_error "Unable to reach pypi.org. Check your internet connection."
+      exit 1
+    fi
+  fi
+  print_success "Internet connection looks good."
+}
+
+# ---------------------------------------------------------------------------
+# Project name validation
+# ---------------------------------------------------------------------------
+
+validate_project_name() {
+  # Usage: validate_project_name "<name>"
+  # Format validation only — existence is checked later once we know the
+  # full target path (name + destination directory combined).
+  local name="$1"
+
+  if [[ -z "${name}" ]]; then
+    echo "Project name cannot be empty."
+    return 1
+  fi
+
+  if [[ ! "${name}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+    echo "Project name may only contain letters, numbers, dashes, underscores, and dots."
+    return 1
+  fi
+
+  return 0
+}
+
+prompt_project_name() {
+  local name=""
+  local error=""
+
+  while true; do
+    read -r -p "$(printf '%b' "${COLOR_BOLD}Project name: ${COLOR_RESET}")" name || true
+
+    if error=$(validate_project_name "${name}"); then
+      PROJECT_NAME="${name}"
+      return 0
+    else
+      print_error "${error}"
+    fi
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Project path resolution
+# ---------------------------------------------------------------------------
+
+resolve_project_path() {
+  # Usage: resolve_project_path "<raw path>"
+  # Expands "~", resolves relative paths against $PWD, and normalizes the
+  # result (collapsing "." / "..") even if the path doesn't exist yet.
+  # Echoes the resolved absolute path.
+  local raw="$1"
+
+  [[ -z "${raw}" ]] && raw="."
+
+  if [[ "${raw}" == "~" || "${raw}" == "~/"* ]]; then
+    raw="${HOME}${raw:1}"
+  fi
+
+  if [[ "${raw}" != /* ]]; then
+    raw="${PWD}/${raw}"
+  fi
+
+  if command -v realpath >/dev/null 2>&1; then
+    realpath -m -- "${raw}"
+  else
+    echo "${raw}"
+  fi
+}
+
+prompt_project_path() {
+  # Prompts for the destination directory the project folder will be
+  # created inside of. Populates PROJECT_DIR (base path + project name).
+  local raw_path=""
+  local base_path=""
+  local answer=""
+
+  while true; do
+    read -r -p "$(printf '%b' "${COLOR_BOLD}Project path (where to create it, default: current directory): ${COLOR_RESET}")" raw_path || true
+
+    base_path=$(resolve_project_path "${raw_path}")
+    PROJECT_DIR="${base_path%/}/${PROJECT_NAME}"
+
+    if [[ -e "${PROJECT_DIR}" ]]; then
+      print_error "A file or directory already exists at '${PROJECT_DIR}'."
+      continue
+    fi
+
+    if [[ ! -d "${base_path}" ]]; then
+      read -r -p "$(printf '%b' "Directory '${base_path}' does not exist. Create it? (Y/n) ")" answer || true
+      if [[ "${answer}" =~ ^[Nn]$ ]]; then
+        continue
+      fi
+      if ! mkdir -p -- "${base_path}" 2>/dev/null; then
+        print_error "Could not create '${base_path}'. Check permissions and try a different path."
+        continue
+      fi
+    fi
+
+    if [[ ! -w "${base_path}" ]]; then
+      print_error "No write permission for '${base_path}'. Choose a different path."
+      continue
+    fi
+
+    print_success "Project will be created at ${PROJECT_DIR}"
+    return 0
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Project scaffolding
+# ---------------------------------------------------------------------------
+
+create_project() {
+  print_info "Creating project structure at ${PROJECT_DIR}..."
+  mkdir -p -- "${PROJECT_DIR}"
+  CREATED_DIR=true
+
+  mkdir -p -- "${PROJECT_DIR}/src" "${PROJECT_DIR}/tests"
+  touch -- "${PROJECT_DIR}/src/__init__.py" "${PROJECT_DIR}/tests/__init__.py"
+
+  print_success "Project directories created."
+}
+
+write_gitignore() {
+  cat >"${PROJECT_DIR}/.gitignore" <<'EOF'
+# Byte-compiled / optimized files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Environment variables
+.env
+
+# Testing & coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+EOF
+}
+
+create_virtualenv() {
+  print_info "Creating virtual environment (.venv)..."
+  (cd "${PROJECT_DIR}" && python3 -m venv .venv)
+  print_success "Virtual environment created."
+
+  print_info "Upgrading pip..."
+  run_with_spinner "Upgrading pip" \
+    "${PROJECT_DIR}/.venv/bin/python" -m pip install --upgrade pip
+}
+
+install_default_packages() {
+  print_info "Installing default development packages: ${DEFAULT_PACKAGES[*]}"
+  run_with_spinner "Installing default packages" \
+    "${PROJECT_DIR}/.venv/bin/pip" install "${DEFAULT_PACKAGES[@]}"
+
+  "${PROJECT_DIR}/.venv/bin/pip" freeze >"${PROJECT_DIR}/requirements.txt"
+  print_success "requirements.txt generated."
+}
+
+# ---------------------------------------------------------------------------
+# Extra package handling
+# ---------------------------------------------------------------------------
+
+validate_package() {
+  # Usage: validate_package "<pkg-spec>"
+  # Strips version specifiers, then queries PyPI via pip (no install attempted).
+  local pkg="$1"
+  local pkg_name="${pkg%%[<>=!~ ]*}"
+
+  [[ -z "${pkg_name}" ]] && return 1
+
+  if "${PROJECT_DIR}/.venv/bin/pip" index versions "${pkg_name}" >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+suggest_close_matches() {
+  # Usage: suggest_close_matches "<typo>"
+  local typo="$1"
+  local pool_csv
+  pool_csv=$(printf '%s,' "${KNOWN_PACKAGE_POOL[@]}")
+
+  "${PROJECT_DIR}/.venv/bin/python" - "$typo" "$pool_csv" <<'PYEOF' 2>/dev/null || true
+import sys
+import difflib
+
+typo = sys.argv[1]
+pool = [p for p in sys.argv[2].split(",") if p]
+matches = difflib.get_close_matches(typo, pool, n=3, cutoff=0.6)
+for m in matches:
+    print(m)
+PYEOF
+}
+
+prompt_extra_packages() {
+  local -a valid_packages=()
+  local raw=""
+
+  print_info "You can add extra pip packages to this project."
+  read -r -p "$(printf '%b' "Enter additional pip packages separated by spaces. Leave blank to skip.\n${COLOR_BOLD}> ${COLOR_RESET}")" raw || true
+
+  if [[ -z "${raw// /}" ]]; then
+    print_info "Skipping extra packages."
+    return 0
+  fi
+
+  # Loop until every requested package name is valid or the user gives up.
+  while true; do
+    local -a candidates=()
+    read -r -a candidates <<<"${raw}"
+
+    local -a bad=()
+    valid_packages=()
+
+    print_info "Validating package names against PyPI..."
+    for pkg in "${candidates[@]}"; do
+      if validate_package "${pkg}"; then
+        valid_packages+=("${pkg}")
+        print_success "  ${pkg} — found on PyPI"
+      else
+        bad+=("${pkg}")
+        print_error "  ${pkg} — not found on PyPI"
+        local suggestions
+        suggestions=$(suggest_close_matches "${pkg}")
+        if [[ -n "${suggestions}" ]]; then
+          print_info "    Did you mean: $(echo "${suggestions}" | tr '\n' ' ')?"
+        fi
+      fi
+    done
+
+    if [[ "${#bad[@]}" -eq 0 ]]; then
+      break
+    fi
+
+    print_warning "Some package names could not be verified: ${bad[*]}"
+    read -r -p "$(printf '%b' "Re-enter corrected package names (or leave blank to skip all extras): ${COLOR_RESET}")" raw || true
+
+    if [[ -z "${raw// /}" ]]; then
+      print_info "Skipping extra packages."
+      return 0
+    fi
+  done
+
+  if [[ "${#valid_packages[@]}" -eq 0 ]]; then
+    return 0
+  fi
+
+  install_extra_packages "${valid_packages[@]}"
+}
+
+install_extra_packages() {
+  local -a packages=("$@")
+  print_info "Installing extra packages: ${packages[*]}"
+  run_with_spinner "Installing extra packages" \
+    "${PROJECT_DIR}/.venv/bin/pip" install "${packages[@]}"
+
+  "${PROJECT_DIR}/.venv/bin/pip" freeze >"${PROJECT_DIR}/requirements.txt"
+  print_success "requirements.txt regenerated with extra packages."
+}
+
+# ---------------------------------------------------------------------------
+# Git setup
+# ---------------------------------------------------------------------------
+
+setup_git() {
+  local answer=""
+  read -r -p "$(printf '%b' "${COLOR_BOLD}Initialize Git repository? (y/N) ${COLOR_RESET}")" answer || true
+
+  if [[ ! "${answer}" =~ ^[Yy]$ ]]; then
+    print_info "Skipping Git initialization."
+    return 0
+  fi
+
+  if ! command -v git >/dev/null 2>&1; then
+    print_error "Git is not installed. Skipping repository initialization."
+    print_info "Install it with: sudo apt update && sudo apt install git"
+    return 0
+  fi
+
+  # Some environments (containers, sudo runs, etc.) refuse to operate on a
+  # directory owned by a different user ("detected dubious ownership").
+  # Whitelisting it here is safe since we just created this directory ourselves.
+  git config --global --add safe.directory "${PROJECT_DIR}" 2>/dev/null || true
+
+  # IMPORTANT: this whole block is wrapped in an `if` so that a git failure
+  # (e.g. GPG signing required by the user's global config, or any other
+  # git error) is handled gracefully instead of triggering the script's
+  # error trap — which would otherwise delete the entire freshly-created
+  # project directory.
+  local git_output
+  if git_output=$(
+    cd "${PROJECT_DIR}" && \
+    git init -q -b main 2>&1 && \
+    git add -A 2>&1 && \
+    git -c user.email="newpy@localhost" -c user.name="newpy" \
+        commit -q --no-gpg-sign -m "Initial project setup" 2>&1
+  ); then
+    print_success "Git repository initialized with an initial commit."
+  else
+    print_warning "Git initialization did not complete; continuing without it."
+    print_info "Git said: ${git_output}"
+    log_to_file "Git init/commit failed: ${git_output}"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# File generation: README, pyproject.toml, main.py
+# ---------------------------------------------------------------------------
+
+create_readme() {
+  local py_version
+  py_version=$("${PROJECT_DIR}/.venv/bin/python" -c 'import platform; print(platform.python_version())')
+
+  local installed
+  installed=$(grep -v '^\s*$' "${PROJECT_DIR}/requirements.txt" | sed 's/^/- /')
+
+  cat >"${PROJECT_DIR}/README.md" <<EOF
+# ${PROJECT_NAME}
+
+Created on $(date '+%Y-%m-%d') with [newpy](https://github.com).
+
+## Environment
+
+- Python version: ${py_version}
+- Virtual environment: \`.venv\`
+
+## Installed packages
+
+${installed}
+
+## Getting started
+
+\`\`\`bash
+source .venv/bin/activate
+python main.py
+\`\`\`
+EOF
+  print_success "README.md created."
+}
+
+create_pyproject() {
+  cat >"${PROJECT_DIR}/pyproject.toml" <<EOF
+[project]
+name = "$(echo "${PROJECT_NAME}" | tr '[:upper:]' '[:lower:]' | tr '_.' '--')"
+version = "0.1.0"
+description = ""
+requires-python = ">=3.10"
+
+[tool.black]
+line-length = 88
+target-version = ["py310"]
+
+[tool.isort]
+profile = "black"
+line_length = 88
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+EOF
+  print_success "pyproject.toml created."
+}
+
+create_main() {
+  cat >"${PROJECT_DIR}/main.py" <<'EOF'
+def main():
+    print("Hello, World!")
+
+
+if __name__ == "__main__":
+    main()
+EOF
+  print_success "main.py created."
+}
+
+# ---------------------------------------------------------------------------
+# Finish
+# ---------------------------------------------------------------------------
+
+finish() {
+  local elapsed=$(( $(date +%s) - START_TIME ))
+  local installed
+  installed=$(grep -v '^\s*$' "${PROJECT_DIR}/requirements.txt" | tr '\n' ' ')
+  local git_status="Not initialized"
+  [[ -d "${PROJECT_DIR}/.git" ]] && git_status="Initialized"
+
+  echo
+  printf '%b\n' "${COLOR_GREEN}${COLOR_BOLD}Project created successfully.${COLOR_RESET}"
+  echo
+  printf '%b\n' "${COLOR_BOLD}Location:${COLOR_RESET}"
+  printf '%s\n' "${PROJECT_DIR}"
+  echo
+  printf '%b\n' "${COLOR_BOLD}Virtual environment:${COLOR_RESET}"
+  printf '%s\n' ".venv"
+  echo
+  printf '%b\n' "${COLOR_BOLD}Installed packages:${COLOR_RESET}"
+  printf '%s\n' "${installed}"
+  echo
+  printf '%b\n' "${COLOR_BOLD}Git:${COLOR_RESET}"
+  printf '%s\n' "${git_status}"
+  echo
+  printf '%b\n' "${COLOR_BOLD}Time elapsed:${COLOR_RESET} ${elapsed}s"
+  echo
+  printf '%b\n' "${COLOR_BOLD}Next commands:${COLOR_RESET}"
+  printf '%b\n' "${COLOR_CYAN}cd ${PROJECT_DIR} ${COLOR_RESET}"
+  printf '%b\n' "${COLOR_CYAN}source .venv/bin/activate${COLOR_RESET}"
+  echo
+
+  log_to_file "Project '${PROJECT_NAME}' created successfully in ${elapsed}s"
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+main() {
+  parse_args "$@"
+
+  mkdir -p "${STATE_DIR}"
+  log_to_file "=== newpy started ==="
+
+  print_banner
+  check_dependencies
+  check_internet
+
+  prompt_project_name
+  prompt_project_path
+  create_project
+  write_gitignore
+  create_virtualenv
+  install_default_packages
+  prompt_extra_packages
+  create_readme
+  create_pyproject
+  create_main
+  setup_git
+
+  finish
+}
+
+main "$@"
