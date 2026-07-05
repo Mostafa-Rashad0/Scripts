@@ -13,7 +13,7 @@ set -Eeuo pipefail
 # Constants & global state
 # ---------------------------------------------------------------------------
 
-readonly NEWPY_VERSION="1.1.1"
+readonly NEWPY_VERSION="1.2.0"
 readonly STATE_DIR="${HOME}/.local/state/newpy"
 readonly LOG_FILE="${STATE_DIR}/newpy.log"
 
@@ -28,15 +28,15 @@ readonly COLOR_BLUE=$'\033[0;34m'
 readonly COLOR_CYAN=$'\033[0;36m'
 readonly COLOR_BOLD=$'\033[1m'
 
-# Default packages installed in every project
+# The 5 baseline packages installed when the user picks "default packages".
+# Chosen to be broadly useful across script types rather than dev-tooling
+# specific: HTTP calls, env config, pretty output/CLI, and testing.
 readonly DEFAULT_PACKAGES=(
-  black
-  ruff
-  pytest
-  isort
-  mypy
-  rich
+  requests
   python-dotenv
+  rich
+  click
+  pytest
 )
 
 # A small pool of well-known package names used only to power
@@ -53,6 +53,10 @@ readonly KNOWN_PACKAGE_POOL=(
 
 PROJECT_NAME=""
 PROJECT_DIR=""
+PROJECT_MODE=""          # "full" (standard) or "single" (single-file script)
+GIT_INIT=false            # whether the user opted into Git initialization
+SELECTED_PACKAGES=()      # packages chosen to install (default set or custom)
+INSTALLED_PACKAGES=""     # `pip freeze` output, captured for README / summary
 CREATED_DIR=false
 START_TIME=$(date +%s)
 
@@ -184,15 +188,20 @@ ${COLOR_BOLD}OPTIONS${COLOR_RESET}
     -v, --version    Show version information and exit
 
 ${COLOR_BOLD}DESCRIPTION${COLOR_RESET}
-    Interactively creates a new Python project with a virtual environment,
-    a curated set of development tools (black, ruff, pytest, isort, mypy,
-    rich, python-dotenv), an optional Git repository, and starter files
-    (README.md, pyproject.toml, main.py, .gitignore).
+    Interactively creates a new Python project with a virtual environment
+    and an entry script named after the project itself (<project>.py).
 
-    You will be asked for a project name and a destination path (defaults
-    to the current directory). Relative paths, "~", and paths that don't
-    exist yet are all supported — non-existent directories can be created
-    for you on confirmation.
+    You will be asked for:
+      - Project name and destination path (relative paths, "~", and
+        non-existent directories are all supported)
+      - Project type: a standard layout (src/, tests/, pyproject.toml) or
+        a single-file script (just <project>.py, nothing else)
+      - Whether to initialize Git (README.md and requirements.txt are only
+        generated when Git is initialized)
+      - Package setup: install a curated set of 5 default packages
+        (requests, python-dotenv, rich, click, pytest), or specify your
+        own — packages are validated against PyPI before installing, with
+        "did you mean...?" suggestions for typos
 
 ${COLOR_BOLD}LOGS${COLOR_RESET}
     Execution logs are written to:
@@ -377,6 +386,48 @@ prompt_project_path() {
 }
 
 # ---------------------------------------------------------------------------
+# Project mode & Git choice (asked up front so later steps know what to
+# generate)
+# ---------------------------------------------------------------------------
+
+prompt_project_mode() {
+  local choice=""
+
+  while true; do
+    printf '%b\n' "${COLOR_BOLD}Project type:${COLOR_RESET}"
+    printf '  %s\n' "[1] Standard project (src/, tests/, pyproject.toml)"
+    printf '  %s\n' "[2] Single-file script (just ${PROJECT_NAME}.py, no extra files)"
+    read -r -p "$(printf '%b' "${COLOR_BOLD}Choose 1 or 2: ${COLOR_RESET}")" choice || true
+
+    case "${choice}" in
+      1)
+        PROJECT_MODE="full"
+        return 0
+        ;;
+      2)
+        PROJECT_MODE="single"
+        return 0
+        ;;
+      *)
+        print_error "Please enter 1 or 2."
+        ;;
+    esac
+  done
+}
+
+prompt_git_choice() {
+  local answer=""
+  read -r -p "$(printf '%b' "${COLOR_BOLD}Initialize Git repository? (y/N) ${COLOR_RESET}")" answer || true
+
+  if [[ "${answer}" =~ ^[Yy]$ ]]; then
+    GIT_INIT=true
+  else
+    GIT_INIT=false
+    print_info "Git will be skipped — README.md and requirements.txt will also be skipped."
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Project scaffolding
 # ---------------------------------------------------------------------------
 
@@ -385,8 +436,10 @@ create_project() {
   mkdir -p -- "${PROJECT_DIR}"
   CREATED_DIR=true
 
-  mkdir -p -- "${PROJECT_DIR}/src" "${PROJECT_DIR}/tests"
-  touch -- "${PROJECT_DIR}/src/__init__.py" "${PROJECT_DIR}/tests/__init__.py"
+  if [[ "${PROJECT_MODE}" == "full" ]]; then
+    mkdir -p -- "${PROJECT_DIR}/src" "${PROJECT_DIR}/tests"
+    touch -- "${PROJECT_DIR}/src/__init__.py" "${PROJECT_DIR}/tests/__init__.py"
+  fi
 
   print_success "Project directories created."
 }
@@ -438,13 +491,44 @@ create_virtualenv() {
     "${PROJECT_DIR}/.venv/bin/python" -m pip install --upgrade pip
 }
 
-install_default_packages() {
-  print_info "Installing default development packages: ${DEFAULT_PACKAGES[*]}"
-  run_with_spinner "Installing default packages" \
-    "${PROJECT_DIR}/.venv/bin/pip" install "${DEFAULT_PACKAGES[@]}"
+prompt_package_setup() {
+  local choice=""
 
-  "${PROJECT_DIR}/.venv/bin/pip" freeze >"${PROJECT_DIR}/requirements.txt"
-  print_success "requirements.txt generated."
+  while true; do
+    printf '%b\n' "${COLOR_BOLD}Package setup:${COLOR_RESET}"
+    printf '  %s\n' "[1] Install default packages (${DEFAULT_PACKAGES[*]})"
+    printf '  %s\n' "[2] Specify custom packages"
+    read -r -p "$(printf '%b' "${COLOR_BOLD}Choose 1 or 2: ${COLOR_RESET}")" choice || true
+
+    case "${choice}" in
+      1)
+        SELECTED_PACKAGES=("${DEFAULT_PACKAGES[@]}")
+        break
+        ;;
+      2)
+        prompt_custom_packages
+        break
+        ;;
+      *)
+        print_error "Please enter 1 or 2."
+        ;;
+    esac
+  done
+
+  if [[ "${#SELECTED_PACKAGES[@]}" -gt 0 ]]; then
+    print_info "Installing packages: ${SELECTED_PACKAGES[*]}"
+    run_with_spinner "Installing packages" \
+      "${PROJECT_DIR}/.venv/bin/pip" install "${SELECTED_PACKAGES[@]}"
+  else
+    print_info "No packages selected — venv will only contain pip."
+  fi
+
+  INSTALLED_PACKAGES=$("${PROJECT_DIR}/.venv/bin/pip" freeze)
+
+  if [[ "${GIT_INIT}" == true ]]; then
+    printf '%s\n' "${INSTALLED_PACKAGES}" >"${PROJECT_DIR}/requirements.txt"
+    print_success "requirements.txt generated."
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -483,15 +567,14 @@ for m in matches:
 PYEOF
 }
 
-prompt_extra_packages() {
-  local -a valid_packages=()
+prompt_custom_packages() {
+  SELECTED_PACKAGES=()
   local raw=""
 
-  print_info "You can add extra pip packages to this project."
-  read -r -p "$(printf '%b' "Enter additional pip packages separated by spaces. Leave blank to skip.\n${COLOR_BOLD}> ${COLOR_RESET}")" raw || true
+  read -r -p "$(printf '%b' "Enter pip packages separated by spaces. Leave blank to install none.\n${COLOR_BOLD}> ${COLOR_RESET}")" raw || true
 
   if [[ -z "${raw// /}" ]]; then
-    print_info "Skipping extra packages."
+    print_info "No packages entered."
     return 0
   fi
 
@@ -500,13 +583,13 @@ prompt_extra_packages() {
     local -a candidates=()
     read -r -a candidates <<<"${raw}"
 
+    local -a valid=()
     local -a bad=()
-    valid_packages=()
 
     print_info "Validating package names against PyPI..."
     for pkg in "${candidates[@]}"; do
       if validate_package "${pkg}"; then
-        valid_packages+=("${pkg}")
+        valid+=("${pkg}")
         print_success "  ${pkg} — found on PyPI"
       else
         bad+=("${pkg}")
@@ -520,33 +603,19 @@ prompt_extra_packages() {
     done
 
     if [[ "${#bad[@]}" -eq 0 ]]; then
-      break
+      SELECTED_PACKAGES=("${valid[@]}")
+      return 0
     fi
 
     print_warning "Some package names could not be verified: ${bad[*]}"
-    read -r -p "$(printf '%b' "Re-enter corrected package names (or leave blank to skip all extras): ${COLOR_RESET}")" raw || true
+    read -r -p "$(printf '%b' "Re-enter the full package list (or leave blank to install none): ${COLOR_RESET}")" raw || true
 
     if [[ -z "${raw// /}" ]]; then
-      print_info "Skipping extra packages."
+      print_info "Proceeding without any packages."
+      SELECTED_PACKAGES=()
       return 0
     fi
   done
-
-  if [[ "${#valid_packages[@]}" -eq 0 ]]; then
-    return 0
-  fi
-
-  install_extra_packages "${valid_packages[@]}"
-}
-
-install_extra_packages() {
-  local -a packages=("$@")
-  print_info "Installing extra packages: ${packages[*]}"
-  run_with_spinner "Installing extra packages" \
-    "${PROJECT_DIR}/.venv/bin/pip" install "${packages[@]}"
-
-  "${PROJECT_DIR}/.venv/bin/pip" freeze >"${PROJECT_DIR}/requirements.txt"
-  print_success "requirements.txt regenerated with extra packages."
 }
 
 # ---------------------------------------------------------------------------
@@ -554,14 +623,6 @@ install_extra_packages() {
 # ---------------------------------------------------------------------------
 
 setup_git() {
-  local answer=""
-  read -r -p "$(printf '%b' "${COLOR_BOLD}Initialize Git repository? (y/N) ${COLOR_RESET}")" answer || true
-
-  if [[ ! "${answer}" =~ ^[Yy]$ ]]; then
-    print_info "Skipping Git initialization."
-    return 0
-  fi
-
   if ! command -v git >/dev/null 2>&1; then
     print_error "Git is not installed. Skipping repository initialization."
     print_info "Install it with: sudo apt update && sudo apt install git"
@@ -603,7 +664,11 @@ create_readme() {
   py_version=$("${PROJECT_DIR}/.venv/bin/python" -c 'import platform; print(platform.python_version())')
 
   local installed
-  installed=$(grep -v '^\s*$' "${PROJECT_DIR}/requirements.txt" | sed 's/^/- /')
+  if [[ -n "${INSTALLED_PACKAGES}" ]]; then
+    installed=$(printf '%s\n' "${INSTALLED_PACKAGES}" | grep -v '^\s*$' | sed 's/^/- /')
+  else
+    installed="_(none)_"
+  fi
 
   cat >"${PROJECT_DIR}/README.md" <<EOF
 # ${PROJECT_NAME}
@@ -623,7 +688,7 @@ ${installed}
 
 \`\`\`bash
 source .venv/bin/activate
-python main.py
+python ${PROJECT_NAME}.py
 \`\`\`
 EOF
   print_success "README.md created."
@@ -660,7 +725,9 @@ EOF
 }
 
 create_main() {
-  cat >"${PROJECT_DIR}/main.py" <<'EOF'
+  local script_file="${PROJECT_DIR}/${PROJECT_NAME}.py"
+
+  cat >"${script_file}" <<'EOF'
 def main():
     print("Hello, World!")
 
@@ -668,7 +735,7 @@ def main():
 if __name__ == "__main__":
     main()
 EOF
-  print_success "main.py created."
+  print_success "${PROJECT_NAME}.py created."
 }
 
 # ---------------------------------------------------------------------------
@@ -678,15 +745,28 @@ EOF
 finish() {
   local elapsed=$(( $(date +%s) - START_TIME ))
   local installed
-  installed=$(grep -v '^\s*$' "${PROJECT_DIR}/requirements.txt" | tr '\n' ' ')
+  if [[ -n "${INSTALLED_PACKAGES}" ]]; then
+    installed=$(printf '%s\n' "${INSTALLED_PACKAGES}" | grep -v '^\s*$' | tr '\n' ' ')
+  else
+    installed="(none)"
+  fi
   local git_status="Not initialized"
   [[ -d "${PROJECT_DIR}/.git" ]] && git_status="Initialized"
+
+  local mode_label="Standard (src/, tests/, pyproject.toml)"
+  [[ "${PROJECT_MODE}" == "single" ]] && mode_label="Single-file script"
 
   echo
   printf '%b\n' "${COLOR_GREEN}${COLOR_BOLD}Project created successfully.${COLOR_RESET}"
   echo
   printf '%b\n' "${COLOR_BOLD}Location:${COLOR_RESET}"
   printf '%s\n' "${PROJECT_DIR}"
+  echo
+  printf '%b\n' "${COLOR_BOLD}Project type:${COLOR_RESET}"
+  printf '%s\n' "${mode_label}"
+  echo
+  printf '%b\n' "${COLOR_BOLD}Script:${COLOR_RESET}"
+  printf '%s\n' "${PROJECT_NAME}.py"
   echo
   printf '%b\n' "${COLOR_BOLD}Virtual environment:${COLOR_RESET}"
   printf '%s\n' ".venv"
@@ -700,8 +780,9 @@ finish() {
   printf '%b\n' "${COLOR_BOLD}Time elapsed:${COLOR_RESET} ${elapsed}s"
   echo
   printf '%b\n' "${COLOR_BOLD}Next commands:${COLOR_RESET}"
-  printf '%b\n' "${COLOR_CYAN}cd ${PROJECT_DIR} ${COLOR_RESET}"
+  printf '%b\n' "${COLOR_CYAN}cd ${PROJECT_DIR}${COLOR_RESET}"
   printf '%b\n' "${COLOR_CYAN}source .venv/bin/activate${COLOR_RESET}"
+  printf '%b\n' "${COLOR_CYAN}python ${PROJECT_NAME}.py${COLOR_RESET}"
   echo
 
   log_to_file "Project '${PROJECT_NAME}' created successfully in ${elapsed}s"
@@ -723,15 +804,30 @@ main() {
 
   prompt_project_name
   prompt_project_path
+  prompt_project_mode
+  prompt_git_choice
+
   create_project
-  write_gitignore
+  if [[ "${GIT_INIT}" == true ]]; then
+    write_gitignore
+  fi
+
   create_virtualenv
-  install_default_packages
-  prompt_extra_packages
-  create_readme
-  create_pyproject
+  prompt_package_setup
+
+  if [[ "${GIT_INIT}" == true ]]; then
+    create_readme
+  fi
+
+  if [[ "${PROJECT_MODE}" == "full" ]]; then
+    create_pyproject
+  fi
+
   create_main
-  setup_git
+
+  if [[ "${GIT_INIT}" == true ]]; then
+    setup_git
+  fi
 
   finish
 }
