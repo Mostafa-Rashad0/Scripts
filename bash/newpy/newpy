@@ -10,10 +10,23 @@
 set -Eeuo pipefail
 
 # ---------------------------------------------------------------------------
+# Resolve where this script actually lives, so we can find the sibling
+# default-packages file regardless of the caller's working directory.
+# ---------------------------------------------------------------------------
+
+if command -v readlink >/dev/null 2>&1; then
+  NEWPY_SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+else
+  NEWPY_SCRIPT_PATH="${BASH_SOURCE[0]}"
+fi
+readonly NEWPY_SCRIPT_DIR="$(cd -- "$(dirname -- "${NEWPY_SCRIPT_PATH}")" &>/dev/null && pwd)"
+readonly DEFAULTS_FILE="${NEWPY_SCRIPT_DIR}/newpy-defaults.conf"
+
+# ---------------------------------------------------------------------------
 # Constants & global state
 # ---------------------------------------------------------------------------
 
-readonly NEWPY_VERSION="1.2.0"
+readonly NEWPY_VERSION="1.3.1"
 readonly STATE_DIR="${HOME}/.local/state/newpy"
 readonly LOG_FILE="${STATE_DIR}/newpy.log"
 
@@ -28,10 +41,16 @@ readonly COLOR_BLUE=$'\033[0;34m'
 readonly COLOR_CYAN=$'\033[0;36m'
 readonly COLOR_BOLD=$'\033[1m'
 
-# The 5 baseline packages installed when the user picks "default packages".
-# Chosen to be broadly useful across script types rather than dev-tooling
-# specific: HTTP calls, env config, pretty output/CLI, and testing.
-readonly DEFAULT_PACKAGES=(
+# The baseline packages installed when the user picks "default packages".
+# NOT readonly: this is populated at runtime by load_default_packages(),
+# which reads ${DEFAULTS_FILE} (a plain-text file next to this script that
+# the user can freely edit) and falls back to a built-in list if that file
+# is missing or unreadable.
+DEFAULT_PACKAGES=()
+
+# Used only if ${DEFAULTS_FILE} doesn't exist yet (it gets created with
+# this content on first run) or can't be read for some reason.
+readonly BUILTIN_FALLBACK_PACKAGES=(
   requests
   python-dotenv
   rich
@@ -57,8 +76,10 @@ PROJECT_MODE=""          # "full" (standard) or "single" (single-file script)
 GIT_INIT=false            # whether the user opted into Git initialization
 SELECTED_PACKAGES=()      # packages chosen to install (default set or custom)
 INSTALLED_PACKAGES=""     # `pip freeze` output, captured for README / summary
+SAME_AS_CWD=false          # true if the project's parent dir is where newpy was invoked
 CREATED_DIR=false
 START_TIME=$(date +%s)
+ORIGINAL_PWD="${PWD}"
 
 # ---------------------------------------------------------------------------
 # Output helpers
@@ -280,6 +301,55 @@ check_internet() {
 }
 
 # ---------------------------------------------------------------------------
+# Default packages file (editable by the user, lives next to this script)
+# ---------------------------------------------------------------------------
+
+load_default_packages() {
+  # Populates DEFAULT_PACKAGES from ${DEFAULTS_FILE}: one package per line,
+  # blank lines and lines starting with '#' are ignored. Creates the file
+  # with built-in defaults if it doesn't exist yet, and falls back to the
+  # built-in list (for this run only) if the file can't be read or written.
+
+  if [[ ! -f "${DEFAULTS_FILE}" ]]; then
+    print_info "No default packages file found — creating one at:"
+    print_info "  ${DEFAULTS_FILE}"
+    if {
+      printf '%s\n' "# newpy default packages"
+      printf '%s\n' "#"
+      printf '%s\n' "# One package per line. Lines starting with '#' and blank lines"
+      printf '%s\n' "# are ignored. Edit this list to change what gets installed when"
+      printf '%s\n' "# you choose \"Install default packages\" in newpy."
+      printf '%s\n' "# Version specifiers are fine, e.g.: requests>=2.31"
+      printf '\n'
+      printf '%s\n' "${BUILTIN_FALLBACK_PACKAGES[@]}"
+    } >"${DEFAULTS_FILE}" 2>/dev/null; then
+      print_success "Default packages file created."
+    else
+      print_warning "Could not create ${DEFAULTS_FILE} (no write permission?)."
+      print_info "Using the built-in default list for this run only."
+      DEFAULT_PACKAGES=("${BUILTIN_FALLBACK_PACKAGES[@]}")
+      return 0
+    fi
+  fi
+
+  DEFAULT_PACKAGES=()
+  local line
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    # Trim leading/trailing whitespace.
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "${line}" ]] && continue
+    [[ "${line}" == \#* ]] && continue
+    DEFAULT_PACKAGES+=("${line}")
+  done <"${DEFAULTS_FILE}"
+
+  if [[ "${#DEFAULT_PACKAGES[@]}" -eq 0 ]]; then
+    print_warning "${DEFAULTS_FILE} has no packages listed. Using the built-in default list for this run."
+    DEFAULT_PACKAGES=("${BUILTIN_FALLBACK_PACKAGES[@]}")
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Project name validation
 # ---------------------------------------------------------------------------
 
@@ -380,6 +450,14 @@ prompt_project_path() {
       continue
     fi
 
+    local resolved_original_pwd
+    resolved_original_pwd=$(resolve_project_path "${ORIGINAL_PWD}")
+    if [[ "${base_path}" == "${resolved_original_pwd}" ]]; then
+      SAME_AS_CWD=true
+    else
+      SAME_AS_CWD=false
+    fi
+
     print_success "Project will be created at ${PROJECT_DIR}"
     return 0
   done
@@ -423,7 +501,7 @@ prompt_git_choice() {
     GIT_INIT=true
   else
     GIT_INIT=false
-    print_info "Git will be skipped — README.md and requirements.txt will also be skipped."
+    print_info "Git will be skipped — README.md will also be skipped (requirements.txt is still generated)."
   fi
 }
 
@@ -496,13 +574,14 @@ prompt_package_setup() {
 
   while true; do
     printf '%b\n' "${COLOR_BOLD}Package setup:${COLOR_RESET}"
-    printf '  %s\n' "[1] Install default packages (${DEFAULT_PACKAGES[*]})"
-    printf '  %s\n' "[2] Specify custom packages"
+    printf '  %s\n' "[1] Install default packages (${DEFAULT_PACKAGES[*]}) — plus optional extras"
+    printf '  %s\n' "[2] Specify custom packages only"
     read -r -p "$(printf '%b' "${COLOR_BOLD}Choose 1 or 2: ${COLOR_RESET}")" choice || true
 
     case "${choice}" in
       1)
         SELECTED_PACKAGES=("${DEFAULT_PACKAGES[@]}")
+        prompt_additional_packages
         break
         ;;
       2)
@@ -525,10 +604,43 @@ prompt_package_setup() {
 
   INSTALLED_PACKAGES=$("${PROJECT_DIR}/.venv/bin/pip" freeze)
 
-  if [[ "${GIT_INIT}" == true ]]; then
-    printf '%s\n' "${INSTALLED_PACKAGES}" >"${PROJECT_DIR}/requirements.txt"
-    print_success "requirements.txt generated."
-  fi
+  # pip freeze permanently omits certain packages that shadow a stdlib
+  # module name (argparse, wsgiref, ...) even though they're genuinely
+  # installed. Make sure every package we explicitly selected is actually
+  # represented in requirements.txt, looking up hidden ones via `pip show`
+  # (which isn't subject to that exclusion).
+  local pkg pkg_name normalized_name already_listed shown_version
+  for pkg in "${SELECTED_PACKAGES[@]}"; do
+    pkg_name="${pkg%%[<>=!~ ]*}"
+    [[ -z "${pkg_name}" ]] && continue
+    normalized_name=$(printf '%s' "${pkg_name}" | tr '[:upper:]_' '[:lower:]-')
+
+    already_listed=false
+    while IFS= read -r line; do
+      [[ -z "${line}" ]] && continue
+      local listed_name
+      listed_name="${line%%==*}"
+      listed_name=$(printf '%s' "${listed_name}" | tr '[:upper:]_' '[:lower:]-')
+      if [[ "${listed_name}" == "${normalized_name}" ]]; then
+        already_listed=true
+        break
+      fi
+    done <<<"${INSTALLED_PACKAGES}"
+
+    if [[ "${already_listed}" == false ]]; then
+      shown_version=$("${PROJECT_DIR}/.venv/bin/pip" show "${pkg_name}" 2>/dev/null | awk -F': ' '/^Version:/{print $2; exit}')
+      if [[ -n "${shown_version}" ]]; then
+        INSTALLED_PACKAGES="${INSTALLED_PACKAGES}
+${pkg_name}==${shown_version}"
+      else
+        print_warning "Could not confirm '${pkg_name}' was installed; skipping it in requirements.txt."
+      fi
+    fi
+  done
+
+  # requirements.txt is always generated, regardless of the Git choice.
+  printf '%s\n' "${INSTALLED_PACKAGES}" >"${PROJECT_DIR}/requirements.txt"
+  print_success "requirements.txt generated."
 }
 
 # ---------------------------------------------------------------------------
@@ -567,18 +679,18 @@ for m in matches:
 PYEOF
 }
 
-prompt_custom_packages() {
-  SELECTED_PACKAGES=()
-  local raw=""
-
-  read -r -p "$(printf '%b' "Enter pip packages separated by spaces. Leave blank to install none.\n${COLOR_BOLD}> ${COLOR_RESET}")" raw || true
+validate_package_list() {
+  # Usage: validate_package_list "<initial raw space-separated list>"
+  # Loops, re-prompting with the SAME wording each time, until every
+  # entered package name is valid on PyPI or the user leaves it blank.
+  # Sets the global VALIDATED_PACKAGES array (may end up empty).
+  local raw="$1"
+  VALIDATED_PACKAGES=()
 
   if [[ -z "${raw// /}" ]]; then
-    print_info "No packages entered."
     return 0
   fi
 
-  # Loop until every requested package name is valid or the user gives up.
   while true; do
     local -a candidates=()
     read -r -a candidates <<<"${raw}"
@@ -603,19 +715,44 @@ prompt_custom_packages() {
     done
 
     if [[ "${#bad[@]}" -eq 0 ]]; then
-      SELECTED_PACKAGES=("${valid[@]}")
+      VALIDATED_PACKAGES=("${valid[@]}")
       return 0
     fi
 
     print_warning "Some package names could not be verified: ${bad[*]}"
-    read -r -p "$(printf '%b' "Re-enter the full package list (or leave blank to install none): ${COLOR_RESET}")" raw || true
+    read -r -p "$(printf '%b' "Re-enter the full package list (or leave blank to skip): ${COLOR_RESET}")" raw || true
 
     if [[ -z "${raw// /}" ]]; then
-      print_info "Proceeding without any packages."
-      SELECTED_PACKAGES=()
+      VALIDATED_PACKAGES=()
       return 0
     fi
   done
+}
+
+prompt_custom_packages() {
+  local raw=""
+  read -r -p "$(printf '%b' "Enter pip packages separated by spaces. Leave blank to install none.\n${COLOR_BOLD}> ${COLOR_RESET}")" raw || true
+
+  validate_package_list "${raw}"
+  SELECTED_PACKAGES=("${VALIDATED_PACKAGES[@]}")
+
+  if [[ "${#SELECTED_PACKAGES[@]}" -eq 0 ]]; then
+    print_info "No packages entered."
+  fi
+}
+
+prompt_additional_packages() {
+  # Used after the user picks the default-packages path — lets them layer
+  # extra custom packages on top of the defaults already in SELECTED_PACKAGES.
+  local raw=""
+  read -r -p "$(printf '%b' "Add any custom packages on top of the defaults? Leave blank to skip.\n${COLOR_BOLD}> ${COLOR_RESET}")" raw || true
+
+  validate_package_list "${raw}"
+
+  if [[ "${#VALIDATED_PACKAGES[@]}" -gt 0 ]]; then
+    SELECTED_PACKAGES+=("${VALIDATED_PACKAGES[@]}")
+    print_info "Will install: ${SELECTED_PACKAGES[*]}"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -673,7 +810,7 @@ create_readme() {
   cat >"${PROJECT_DIR}/README.md" <<EOF
 # ${PROJECT_NAME}
 
-Created on $(date '+%Y-%m-%d') with [newpy](https://github.com).
+Created on $(date '+%Y-%m-%d') with [newpy](https://github.com/Mostafa-Rashad0/newpy).
 
 ## Environment
 
@@ -779,10 +916,17 @@ finish() {
   echo
   printf '%b\n' "${COLOR_BOLD}Time elapsed:${COLOR_RESET} ${elapsed}s"
   echo
-  printf '%b\n' "${COLOR_BOLD}Next commands:${COLOR_RESET}"
-  printf '%b\n' "${COLOR_CYAN}cd ${PROJECT_DIR}${COLOR_RESET}"
-  printf '%b\n' "${COLOR_CYAN}source .venv/bin/activate${COLOR_RESET}"
-  printf '%b\n' "${COLOR_CYAN}python ${PROJECT_NAME}.py${COLOR_RESET}"
+
+  if [[ "${SAME_AS_CWD}" == true && -t 0 && -t 1 ]]; then
+    printf '%b\n' "${COLOR_BOLD}Next command:${COLOR_RESET}"
+    printf '%b\n' "${COLOR_CYAN}python ${PROJECT_NAME}.py${COLOR_RESET}"
+    printf '%b\n' "(dropping you into an activated shell inside the project now...)"
+  else
+    printf '%b\n' "${COLOR_BOLD}Next commands:${COLOR_RESET}"
+    printf '%b\n' "${COLOR_CYAN}cd ${PROJECT_DIR}${COLOR_RESET}"
+    printf '%b\n' "${COLOR_CYAN}source .venv/bin/activate${COLOR_RESET}"
+    printf '%b\n' "${COLOR_CYAN}python ${PROJECT_NAME}.py${COLOR_RESET}"
+  fi
   echo
 
   log_to_file "Project '${PROJECT_NAME}' created successfully in ${elapsed}s"
@@ -801,6 +945,7 @@ main() {
   print_banner
   check_dependencies
   check_internet
+  load_default_packages
 
   prompt_project_name
   prompt_project_path
@@ -830,6 +975,21 @@ main() {
   fi
 
   finish
+
+  # If the project was created directly in the directory the user invoked
+  # newpy from, drop them straight into an activated shell inside it —
+  # no manual cd/activate needed. Skipped when not attached to a real
+  # terminal (e.g. piped input, CI), since there'd be nothing to interact
+  # with. Their original shell resumes normally when this one exits.
+  if [[ "${SAME_AS_CWD}" == true && -t 0 && -t 1 ]]; then
+    local rcfile
+    rcfile=$(mktemp)
+    [[ -f "${HOME}/.bashrc" ]] && cat "${HOME}/.bashrc" >"${rcfile}" 2>/dev/null
+    printf '\nsource "%s/.venv/bin/activate"\n' "${PROJECT_DIR}" >>"${rcfile}"
+    printf 'rm -f "%s"\n' "${rcfile}" >>"${rcfile}"
+    cd "${PROJECT_DIR}" || exit 1
+    exec bash --rcfile "${rcfile}" -i
+  fi
 }
 
 main "$@"
