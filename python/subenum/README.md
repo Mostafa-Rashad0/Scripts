@@ -1,0 +1,33 @@
+# dirdom
+
+Created on 2026-07-06 with [newpy](https://github.com).
+
+## Environment
+
+- Python version: 3.14.4
+- Virtual environment: `.venv`
+
+## Installed packages
+
+- certifi==2026.6.17
+- charset-normalizer==3.4.7
+- click==8.4.2
+- idna==3.18
+- iniconfig==2.3.0
+- markdown-it-py==4.2.0
+- mdurl==0.1.2
+- packaging==26.2
+- pluggy==1.6.0
+- Pygments==2.20.0
+- pytest==9.1.1
+- python-dotenv==1.2.2
+- requests==2.34.2
+- rich==15.0.0
+- urllib3==2.7.0
+
+## Getting started
+
+```bash
+source .venv/bin/activate
+python dirdom.py
+```
